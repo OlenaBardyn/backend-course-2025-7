@@ -1,75 +1,76 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const multer = require('multer'); //обробка файлів у HTML формах
+const multer = require('multer');
 const { Command } = require('commander');
 const swaggerJsdoc = require('swagger-jsdoc');
 const swaggerUi = require('swagger-ui-express');
+const { Pool } = require('pg');
+const dotenv = require('dotenv');
+
+dotenv.config();
 
 const program = new Command();
 program
-  .requiredOption('-h, --host <host>')
-  .requiredOption('-p, --port <port>')
-  .requiredOption('-c, --cache <cache>');
+  .option('-h, --host <host>', 'Server host', '0.0.0.0')
+  .option('-p, --port <port>', 'Server port', '3000')
+  .option('-c, --cache <cache>', 'Cache folder', '/app/uploads');
 program.parse(process.argv);
 const options = program.opts();
 
-const photoFolder = path.resolve(options.cache); //складає шлях починаючи з поточної директорії
-if (!fs.existsSync(photoFolder)) fs.mkdirSync(photoFolder, { recursive: true });
+const HOST = options.host || process.env.SERVER_HOST || '0.0.0.0';
+const PORT = options.port || process.env.SERVER_PORT || 3000;
+const CACHE_DIR = options.cache || process.env.CACHE_PATH || './uploads';
 
-// express
-const app = express(); 
-app.use(express.json()); // автоматично парсить JSON з тіла запиту
-app.use(express.urlencoded({ extended: true })); // парсить дані форм (x-www-form-urlencoded)
+console.log('testeeeeeee');
+console.log('test2');
+console.log('test3');
 
-// multer
+// Підключення до PostgreSQL
+const pool = new Pool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  port: process.env.DB_PORT || 5432,
+  connectionString: `postgresql://${process.env.DB_USER}:${process.env.DB_PASSWORD}@db:5432/${process.env.DB_NAME}`,
+});
+
+const photoFolder = path.resolve(CACHE_DIR);
+if (!fs.existsSync(photoFolder)) {
+  fs.mkdirSync(photoFolder, { recursive: true });
+}
+
+// Express
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Multer
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, photoFolder), //callback, який каже де зберігати
+  destination: (req, file, cb) => cb(null, photoFolder),
   filename: (req, file, cb) =>
-    cb(null, `${file.originalname.replace(/\s+/g, '_')}`)
+    cb(null, `${Date.now()}_${file.originalname.replace(/\s+/g, '_')}`)
 });
 const upload = multer({ storage });
 
-////////
-const inventory = {}; //об'єкт, що зберігає всі предмети
-let nextId = 1;
-
+// Swagger
 const swaggerOptions = {
   definition: {
     openapi: '3.0.0',
     info: { title: 'Inventory Service API', version: '1.0.0', description: 'API documentation' },
-    servers: [{ url: `http://${options.host}:${options.port}` }]
+    servers: [{ url: `http://${HOST}:${PORT}` }]
   },
   apis: ['./main.js']
 };
 const swaggerSpec = swaggerJsdoc(swaggerOptions);
 app.use('/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
 
-//HTML forms
-/**
- * @swagger
- * /RegisterForm.html:
- *   get:
- *     summary: Повертає форму реєстрації
- *     tags: [HTML Forms]
- *     responses:
- *       200:
- *         description: HTML сторінка
- */
+
 app.get('/RegisterForm.html', (req, res) =>
   res.sendFile(path.join(__dirname, 'RegisterForm.html'))
 );
 
-/**
- * @swagger
- * /SearchForm.html:
- *   get:
- *     summary: Повертає форму пошуку
- *     tags: [HTML Forms]
- *     responses:
- *       200:
- *         description: HTML сторінка
- */
 app.get('/SearchForm.html', (req, res) =>
   res.sendFile(path.join(__dirname, 'SearchForm.html'))
 );
@@ -100,19 +101,21 @@ app.get('/SearchForm.html', (req, res) =>
  *       400:
  *         description: Не вказано name
  */
-app.post('/register', upload.single('photo'), (req, res) => {
+app.post('/register', upload.single('photo'), async (req, res) => {
   const name = req.body.inventory_name;
   if (!name) return res.status(400).json({ error: 'no inventory_name' });
 
-  const id = String(nextId++);
-  const newitem = {
-    id,
-    inventory_name: name,
-    description: req.body.description || '',
-    photoFile: req.file ? path.basename(req.file.path) : null //basename отримує ім'я файлу без шляху
-  };
-  inventory[id] = newitem; 
-  res.status(201).json(newitem);
+  try {
+    const photoFile = req.file ? path.basename(req.file.path) : null;
+    const result = await pool.query(
+      'INSERT INTO items (inventory_name, description, photoFile) VALUES ($1, $2, $3) RETURNING *',
+      [name, req.body.description || '', photoFile]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 /**
@@ -125,8 +128,14 @@ app.post('/register', upload.single('photo'), (req, res) => {
  *       200:
  *         description: Масив інвентаря
  */
-app.get('/inventory', (req, res) => {
-  res.json(Object.values(inventory));
+app.get('/inventory', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM items ORDER BY id ASC');
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 /**
@@ -140,17 +149,22 @@ app.get('/inventory', (req, res) => {
  *         name: id
  *         required: true
  *         schema:
- *           type: string
+ *           type: integer
  *     responses:
  *       200:
  *         description: Успішно
  *       404:
  *         description: Не знайдено
  */
-app.get('/inventory/:id', (req, res) => { // :id - динамічна частина url
-  const item = inventory[req.params.id]; //req.params.id отримує ID з URL
-  if (!item) return res.status(404).json({ error: 'Not found' });
-  res.json(item);
+app.get('/inventory/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM items WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+    res.json(result.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 /**
@@ -164,7 +178,7 @@ app.get('/inventory/:id', (req, res) => { // :id - динамічна части
  *         name: id
  *         required: true
  *         schema:
- *           type: string
+ *           type: integer
  *     requestBody:
  *       required: true
  *       content:
@@ -182,14 +196,24 @@ app.get('/inventory/:id', (req, res) => { // :id - динамічна части
  *       404:
  *         description: Не знайдено
  */
-app.put('/inventory/:id', (req, res) => {
-  const item = inventory[req.params.id]; 
-  if (!item) return res.status(404).json({ error: 'Not found' });
+app.put('/inventory/:id', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM items WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
 
-  if (req.body.inventory_name) item.inventory_name = req.body.inventory_name;
-  if (req.body.description !== undefined) item.description = req.body.description;
+    const item = result.rows[0];
+    const newName = req.body.inventory_name !== undefined ? req.body.inventory_name : item.inventory_name;
+    const newDesc = req.body.description !== undefined ? req.body.description : item.description;
 
-  res.json(item);
+    const updateResult = await pool.query(
+      'UPDATE items SET inventory_name = $1, description = $2 WHERE id = $3 RETURNING *',
+      [newName, newDesc, req.params.id]
+    );
+    res.json(updateResult.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 /**
@@ -203,21 +227,28 @@ app.put('/inventory/:id', (req, res) => {
  *         name: id
  *         required: true
  *         schema:
- *           type: string
+ *           type: integer
  *     responses:
  *       200:
  *         description: Фото
  *       404:
  *         description: Не знайдено
  */
-app.get('/inventory/:id/photo', (req, res) => {
-  const item = inventory[req.params.id];
-  if (!item || !item.photoFile) return res.status(404).json({ error: 'Photo not found' });
+app.get('/inventory/:id/photo', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT photoFile FROM items WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0 || !result.rows[0].photofile) {
+      return res.status(404).json({ error: 'Photo not found' });
+    }
 
-  const filePath = path.join(photoFolder, item.photoFile);
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Photo file missing' });
+    const filePath = path.join(photoFolder, result.rows[0].photofile);
+    if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'Photo file missing' });
 
-  res.sendFile(filePath);
+    res.sendFile(filePath);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
 });
 
 /**
@@ -231,7 +262,7 @@ app.get('/inventory/:id/photo', (req, res) => {
  *         name: id
  *         required: true
  *         schema:
- *           type: string
+ *           type: integer
  *     requestBody:
  *       required: true
  *       content:
@@ -248,17 +279,31 @@ app.get('/inventory/:id/photo', (req, res) => {
  *       404:
  *         description: Не знайдено
  */
-app.put('/inventory/:id/photo', upload.single('photo'), (req, res) => { //оновлює або додає фото
-  const item = inventory[req.params.id];
-  if (!item) return res.status(404).json({ error: 'Not found' });
+app.put('/inventory/:id/photo', upload.single('photo'), async (req, res) => {
+  try {
+    const result = await pool.query('SELECT photoFile FROM items WHERE id = $1', [req.params.id]);
+    if (result.rows.length === 0) {
+      if (req.file) fs.unlinkSync(req.file.path);
+      return res.status(404).json({ error: 'Not found' });
+    }
 
-  if (item.photoFile) {
-    const oldFile = path.join(photoFolder, item.photoFile);
-    if (fs.existsSync(oldFile)) fs.unlinkSync(oldFile);
+    // Видалити старе фото
+    const oldPhoto = result.rows[0].photofile;
+    if (oldPhoto) {
+      const oldFilePath = path.join(photoFolder, oldPhoto);
+      if (fs.existsSync(oldFilePath)) fs.unlinkSync(oldFilePath);
+    }
+
+    // Оновити новим фото
+    const newPhotoFile = req.file ? path.basename(req.file.path) : null;
+    await pool.query('UPDATE items SET photoFile = $1 WHERE id = $2', [newPhotoFile, req.params.id]);
+
+    const updatedResult = await pool.query('SELECT * FROM items WHERE id = $1', [req.params.id]);
+    res.json(updatedResult.rows[0]);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
   }
-
-  item.photoFile = path.basename(req.file.path);
-  res.json(item);
 });
 
 /**
@@ -272,24 +317,30 @@ app.put('/inventory/:id/photo', upload.single('photo'), (req, res) => { //оно
  *         name: id
  *         required: true
  *         schema:
- *           type: string
+ *           type: integer
  *     responses:
  *       200:
  *         description: Видалено
  *       404:
  *         description: Не знайдено
  */
-app.delete('/inventory/:id', (req, res) => {
-  const item = inventory[req.params.id];
-  if (!item) return res.status(404).json({ error: 'Not found' });
+app.delete('/inventory/:id', async (req, res) => {
+  try {
+    const result = await pool.query('DELETE FROM items WHERE id = $1 RETURNING photoFile', [req.params.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
 
-  if (item.photoFile) {
-    const ph = path.join(photoFolder, item.photoFile);
-    if (fs.existsSync(ph)) fs.unlinkSync(ph);
+    // Видалити фото
+    const photoFile = result.rows[0].photofile;
+    if (photoFile) {
+      const filePath = path.join(photoFolder, photoFile);
+      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    }
+
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
   }
-
-  delete inventory[req.params.id];
-  res.json({ message: 'Deleted' });
 });
 
 /**
@@ -306,7 +357,7 @@ app.delete('/inventory/:id', (req, res) => {
  *             type: object
  *             properties:
  *               id:
- *                 type: string
+ *                 type: integer
  *               includePhoto:
  *                 type: string
  *     responses:
@@ -315,23 +366,75 @@ app.delete('/inventory/:id', (req, res) => {
  *       404:
  *         description: Не знайдено
  */
-app.post('/search', (req, res) => {
-  const id = req.body.id; //ID в тілі запиту (форма)
-  if (!id) return res.status(400).json({ error: 'no id' });
+app.post('/search', async (req, res) => {
+  try {
+    const id = req.body.id;
+    if (!id) return res.status(400).json({ error: 'no id' });
 
-  const item = inventory[id];
-  if (!item) return res.status(404).json({ error: 'Not found' });
+    const result = await pool.query('SELECT * FROM items WHERE id = $1', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
 
-  const result = { ...item };
-  if (req.body.includePhoto === 'on' && item.photoFile) {
-    result.photo_url = `/inventory/${id}/photo`;
+    const item = result.rows[0];
+    const response = { ...item };
+    if (req.body.includePhoto === 'on' && item.photofile) {
+      response.photo_url = `/inventory/${id}/photo`;
+    }
+
+    res.json(response);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
   }
-
-  res.json(result);
 });
 
-app.use((req, res) => res.status(405).json({ error: 'Method not allowed' })); // викликається для всіх методів, якщо жоден попередній маршрут не підійшов
+/**
+ * @swagger
+ * /search:
+ *   get:
+ *     summary: Пошук речі за ID
+ *     tags: [Inventory]
+ *     parameters:
+ *       - in: query
+ *         name: id
+ *         required: true
+ *         schema:
+ *           type: integer
+ *       - in: query
+ *         name: includePhoto
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Результат пошуку
+ *       404:
+ *         description: Не знайдено
+ *       500:
+ *         description: Помилка сервера
+ */
+app.get('/search', async (req, res) => {
+  try {
+    const id = req.query.id;
+    if (!id) return res.status(400).json({ error: 'no id' });
 
-app.listen(options.port, options.host, () => {
-  console.log(`Server running at http://${options.host}:${options.port}`);
+    const result = await pool.query('SELECT * FROM items WHERE id = $1', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Not found' });
+
+    const item = result.rows[0];
+    const response = { ...item };
+    
+    if (req.query.includePhoto && item.photofile) {
+      response.photo_url = `/inventory/${id}/photo`;
+    }
+
+    res.json(response);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
+app.use((req, res) => res.status(405).json({ error: 'Method not allowed' }));
+
+app.listen(PORT, HOST, () => {
+  console.log(`Server running at http://${HOST}:${PORT}`);
 });
